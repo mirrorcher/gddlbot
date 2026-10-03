@@ -21,6 +21,7 @@ from telegram import (
     InlineKeyboardMarkup,
     InlineQueryResultArticle,
     InputTextMessageContent,
+    LinkPreviewOptions,
     Update,
 )
 from telegram.constants import ParseMode
@@ -52,6 +53,10 @@ LEVEL_URL_TEMPLATE = os.getenv("GDDL_LEVEL_URL", f"{GDDL_SITE}/level/{{id}}")
 DEMONLIST_API = os.getenv("DEMONLIST_API", "https://api.demonlist.org")
 DEMONLIST_PATH = os.getenv("DEMONLIST_PATH", "/level/classic/list")
 DEMONLIST_LIMIT = 50
+# Шаблон ссылки на страницу уровня на demonlist.org: число в адресе это позиция уровня
+# (например, https://demonlist.org/classic/1828). Доступные поля: {placement},
+# {id} (внутренний ID уровня в Demonlist), {ingame_id}. Пустая строка отключает ссылку.
+DEMONLIST_LEVEL_URL = os.getenv("DEMONLIST_LEVEL_URL", "https://demonlist.org/classic/{placement}")
 
 MAX_RESULTS = 10
 MIN_QUERY_LEN = 2
@@ -59,7 +64,7 @@ CACHE_TTL = 300  # секунд
 
 _cache: dict[str, tuple[float, list[dict]]] = {}
 _detail_cache: dict[int, tuple[float, dict]] = {}
-_demonlist_cache: dict[str, tuple[float, dict[int, int]]] = {}
+_demonlist_cache: dict[str, tuple[float, dict[int, dict]]] = {}
 
 YT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
@@ -125,6 +130,7 @@ def from_search(raw: dict) -> dict | None:
         "song_id": None,
         "rank": None,
         "rank_source": None,  # "demonlist" или "gddl"
+        "demonlist_url": None,
         "url": LEVEL_URL_TEMPLATE.format(id=level_id),
     }
 
@@ -169,15 +175,15 @@ async def _enrich(client: httpx.AsyncClient, lvl: dict) -> None:
         merge_detail(lvl, detail)
 
 
-async def demonlist_positions(client: httpx.AsyncClient, term: str) -> dict[int, int]:
-    """{ID уровня в игре: позиция в Global Demonlist} для уровней, найденных по запросу."""
+async def demonlist_positions(client: httpx.AsyncClient, term: str) -> dict[int, dict]:
+    """{ID уровня в игре: {"placement", "id"}} для уровней Global Demonlist, найденных по запросу."""
     key = term.casefold()
     now = time.time()
     hit = _demonlist_cache.get(key)
     if hit and now - hit[0] < CACHE_TTL:
         return hit[1]
 
-    positions: dict[int, int] = {}
+    positions: dict[int, dict] = {}
     try:
         resp = await client.get(
             DEMONLIST_API + DEMONLIST_PATH,
@@ -189,7 +195,10 @@ async def demonlist_positions(client: httpx.AsyncClient, term: str) -> dict[int,
         for item in levels:
             ingame_id, placement = item.get("ingame_id"), item.get("placement")
             if ingame_id and placement:
-                positions[int(ingame_id)] = int(placement)
+                positions[int(ingame_id)] = {
+                    "placement": int(placement),
+                    "id": item.get("id"),
+                }
     except Exception as e:
         log.info("demonlist lookup failed for %r: %s", term, type(e).__name__)
         return {}  # при сбое не кэшируем, чтобы повторить при следующем запросе
@@ -214,10 +223,18 @@ async def apply_demonlist(client: httpx.AsyncClient, query: str, levels: list[di
             positions.update(found)
 
     for lvl in levels:
-        placement = positions.get(lvl["id"])
-        if placement:
-            lvl["rank"] = placement
-            lvl["rank_source"] = "demonlist"
+        entry = positions.get(lvl["id"])
+        if not entry:
+            continue
+        lvl["rank"] = entry["placement"]
+        lvl["rank_source"] = "demonlist"
+        if DEMONLIST_LEVEL_URL:
+            try:
+                lvl["demonlist_url"] = DEMONLIST_LEVEL_URL.format(
+                    id=entry["id"], placement=entry["placement"], ingame_id=lvl["id"]
+                )
+            except (KeyError, IndexError):
+                log.warning("Некорректный шаблон DEMONLIST_LEVEL_URL")
 
 
 async def search_levels(client: httpx.AsyncClient, query: str) -> list[dict]:
@@ -271,6 +288,10 @@ def card_text(lvl: dict) -> str:
     if lvl["song_name"]:
         lines.append(f"🎵 Музыка: {html.escape(str(lvl['song_name']))}")
     lines.append(f'🔗 <a href="{html.escape(lvl["url"], quote=True)}">Открыть в GDDL</a>')
+    if lvl["demonlist_url"]:
+        lines.append(
+            f'📋 <a href="{html.escape(lvl["demonlist_url"], quote=True)}">Открыть в Demonlist</a>'
+        )
     return "\n".join(lines)
 
 
@@ -363,11 +384,15 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     me = await context.bot.get_me()
     await update.message.reply_text(
-        "Я ищу демонов на GDDL.\n\n"
-        f"В любом чате напиши @{me.username} и название уровня, например:\n"
-        f"@{me.username} Cataclysm\n\n"
-        "Выбери нужный уровень из списка: отправлю место, сложность, enjoyment, "
-        "ID и ссылку, а ниже будут кнопки «Шоукейс» и «Музыка»."
+        "Привет! Я бот для поиска информации о уровнях в GD.\n"
+        f"В любом чате (даже в этом) введи <code>@{html.escape(me.username)}</code> "
+        "и название уровня.\n"
+        "И я выведу тебе: положение в топе, сложность, енджоймент, айди, ссылку в GDDL "
+        "и в Demonlist (если это экстрим), ссылку на песню в Newgrounds и на шоукейс.\n"
+        "Интеграция происходит из https://demonlist.org/ (для позиции экстрим демонов) "
+        "и https://gdladder.com/ (для остальных демонов)",
+        parse_mode=ParseMode.HTML,
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
 
 

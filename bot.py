@@ -3,7 +3,7 @@ Inline-бот для Telegram: поиск демонов на GDDL (https://gdla
 
 Использование в любом чате:  @gdladderbot Cataclysm
 Бот показывает список подходящих уровней; после выбора отправляется карточка
-с местом, сложностью (tier), enjoyment, ID, типом демона и ссылкой на GDDL.
+с местом в топе, сложностью (tier), enjoyment, ID, типом демона и ссылкой на GDDL.
 Под карточкой кнопки «Шоукейс» и «Музыка».
 """
 
@@ -34,17 +34,18 @@ from telegram.ext import (
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
 )
+# httpx пишет в INFO полный URL запроса, а для Telegram в нём лежит токен бота.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("gddl-bot")
 
 # ---------------------------------------------------------------- настройки
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
-# Если API у GDDL окажется другим, меняется только здесь (через переменные окружения).
 GDDL_SITE = os.getenv("GDDL_SITE", "https://gdladder.com")
 GDDL_API_BASE = os.getenv("GDDL_API_BASE", f"{GDDL_SITE}/api")
-SEARCH_PATH = os.getenv("GDDL_SEARCH_PATH", "/level/search")
+SEARCH_PATH = os.getenv("GDDL_SEARCH_PATH", "/levels")
 SEARCH_PARAM = os.getenv("GDDL_SEARCH_PARAM", "name")
-DETAIL_PATH = os.getenv("GDDL_DETAIL_PATH", "/level/{id}")  # для докачки шоукейса/музыки
+DETAIL_PATH = os.getenv("GDDL_DETAIL_PATH", "/levels/{id}")
 LEVEL_URL_TEMPLATE = os.getenv("GDDL_LEVEL_URL", f"{GDDL_SITE}/level/{{id}}")
 
 MAX_RESULTS = 10
@@ -52,39 +53,27 @@ MIN_QUERY_LEN = 2
 CACHE_TTL = 300  # секунд
 
 _cache: dict[str, tuple[float, list[dict]]] = {}
-_detail_cache: dict[str, tuple[float, dict]] = {}
+_detail_cache: dict[int, tuple[float, dict]] = {}
 
 YT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
 
-# ------------------------------------------------------------- работа с GDDL
-def _first(d: dict, *keys):
-    """Первое непустое значение из словаря по списку возможных ключей."""
-    if not isinstance(d, dict):
-        return None
-    for k in keys:
-        if k in d and d[k] not in (None, "", 0):
-            return d[k]
-    return None
-
-
+# ----------------------------------------------------------------- утилиты
 def _fmt_num(v) -> str | None:
     if v is None:
         return None
     try:
         return f"{float(v):.2f}"
     except (TypeError, ValueError):
-        return str(v)
+        return None
 
 
 def _demon_label(v) -> str | None:
-    """Приводит сложность демона к виду «Extreme Demon»."""
+    """«Extreme» -> «Extreme Demon»."""
     if not isinstance(v, str) or not v.strip():
         return None
     v = v.strip()
-    if "demon" not in v.casefold():
-        v += " Demon"
-    return v
+    return v if "demon" in v.casefold() else f"{v} Demon"
 
 
 def _showcase_url(v) -> str | None:
@@ -98,88 +87,78 @@ def _showcase_url(v) -> str | None:
     return None
 
 
-def _music_url(raw: dict, meta: dict) -> tuple[str | None, str | None]:
-    """Возвращает (ссылка, название песни)."""
-    song = _first(raw, "Song", "song") or _first(meta, "Song", "song")
-    song_name = None
-    song_id = None
-    if isinstance(song, dict):
-        song_name = _first(song, "Name", "name", "Title", "title")
-        song_id = _first(song, "ID", "id", "SongID")
-    elif isinstance(song, str):
-        song_name = song
-    song_id = song_id or _first(raw, "SongID", "songId") or _first(meta, "SongID", "songId")
-
-    url = _first(raw, "SongURL", "songUrl") or _first(meta, "SongURL", "songUrl")
-    if not url and song_id:
-        try:
-            if int(song_id) > 0:
-                url = f"https://www.newgrounds.com/audio/listen/{int(song_id)}"
-        except (TypeError, ValueError):
-            pass
-    return url, (str(song_name) if song_name else None)
+def _song_url(song_id, song_name) -> str | None:
+    """Newgrounds, если известен ID песни; иначе поиск на YouTube по названию."""
+    try:
+        if song_id and int(song_id) > 0:
+            return f"https://www.newgrounds.com/audio/listen/{int(song_id)}"
+    except (TypeError, ValueError):
+        pass
+    if song_name:
+        return "https://www.youtube.com/results?search_query=" + quote_plus(
+            f"{song_name} Geometry Dash"
+        )
+    return None
 
 
-def normalize(raw: dict) -> dict | None:
-    """Приводит уровень из ответа сайта к единому виду."""
-    meta = raw.get("Meta") or raw.get("meta") or {}
-    level_id = _first(raw, "ID", "id", "LevelID", "levelId") or _first(meta, "ID", "id")
-    name = _first(meta, "Name", "name") or _first(raw, "Name", "name")
+# ------------------------------------------------------------- работа с GDDL
+def from_search(raw: dict) -> dict | None:
+    """Элемент из /levels?name=... (плоский формат, ключи в нижнем регистре)."""
+    level_id = raw.get("id")
+    name = raw.get("name")
     if level_id is None or not name:
         return None
-
-    music_url, song_name = _music_url(raw, meta)
     return {
         "id": level_id,
         "name": str(name),
-        "tier": _fmt_num(_first(raw, "Rating", "rating", "Tier", "tier")),
-        "enjoyment": _fmt_num(_first(raw, "Enjoyment", "enjoyment")),
-        "rank": _first(raw, "Rank", "rank", "Position", "position", "Place"),
-        "demon": _demon_label(
-            _first(meta, "Difficulty", "difficulty") or _first(raw, "Difficulty", "difficulty")
-        ),
+        "tier": _fmt_num(raw.get("rating")),
+        "enjoyment": _fmt_num(raw.get("enjoyment")),
+        "demon": _demon_label(raw.get("difficulty")),
+        "showcase": _showcase_url(raw.get("showcase")),
+        "song_name": raw.get("songName") or None,
+        "song_id": None,
+        "rank": None,
         "url": LEVEL_URL_TEMPLATE.format(id=level_id),
-        "showcase": _showcase_url(
-            _first(raw, "Showcase", "showcase", "ShowcaseVideoID", "ShowcaseURL")
-            or _first(meta, "Showcase", "showcase", "ShowcaseVideoID", "ShowcaseURL")
-        ),
-        "music": music_url,
-        "song_name": song_name,
     }
 
 
-def _extract_items(data):
-    if isinstance(data, dict):
-        return _first(data, "levels", "Levels", "results", "data", "items") or []
-    return data
+def merge_detail(lvl: dict, d: dict) -> None:
+    """Дополняет уровень данными из /levels/{id} (ключи с большой буквы, есть Meta)."""
+    meta = d.get("Meta") or {}
+    song = meta.get("Song") or {}
+
+    rank = d.get("DifficultyIndex")
+    if rank:
+        lvl["rank"] = rank
+    lvl["tier"] = _fmt_num(d.get("Rating")) or lvl["tier"]
+    lvl["enjoyment"] = _fmt_num(d.get("Enjoyment")) or lvl["enjoyment"]
+    lvl["demon"] = _demon_label(meta.get("Difficulty")) or lvl["demon"]
+    lvl["showcase"] = _showcase_url(d.get("Showcase")) or lvl["showcase"]
+    lvl["song_name"] = song.get("Name") or lvl["song_name"]
+    lvl["song_id"] = song.get("ID") or meta.get("SongID") or lvl["song_id"]
 
 
 async def _enrich(client: httpx.AsyncClient, lvl: dict) -> None:
-    """Если в результатах поиска нет шоукейса/музыки, пробует взять их со страницы уровня."""
-    if lvl["showcase"] and lvl["music"]:
-        return
-    key = str(lvl["id"])
+    lid = lvl["id"]
     now = time.time()
-    hit = _detail_cache.get(key)
+    hit = _detail_cache.get(lid)
     if hit and now - hit[0] < CACHE_TTL:
         detail = hit[1]
     else:
         try:
             resp = await client.get(
-                GDDL_API_BASE + DETAIL_PATH.format(id=lvl["id"]), timeout=6.0
+                GDDL_API_BASE + DETAIL_PATH.format(id=lid), timeout=6.0
             )
             resp.raise_for_status()
-            data = resp.json()
-            raw = data[0] if isinstance(data, list) and data else data
-            detail = normalize(raw) if isinstance(raw, dict) else None
-        except Exception:
-            log.info("detail fetch failed for %s", lvl["id"])
-            detail = None
-        _detail_cache[key] = (now, detail or {})
+            detail = resp.json()
+            if not isinstance(detail, dict):
+                detail = {}
+        except Exception as e:
+            log.info("detail fetch failed for %s: %s", lid, type(e).__name__)
+            detail = {}
+        _detail_cache[lid] = (now, detail)
     if detail:
-        lvl["showcase"] = lvl["showcase"] or detail.get("showcase")
-        lvl["music"] = lvl["music"] or detail.get("music")
-        lvl["song_name"] = lvl["song_name"] or detail.get("song_name")
+        merge_detail(lvl, detail)
 
 
 async def search_levels(client: httpx.AsyncClient, query: str) -> list[dict]:
@@ -194,12 +173,13 @@ async def search_levels(client: httpx.AsyncClient, query: str) -> list[dict]:
         params={SEARCH_PARAM: query, "limit": MAX_RESULTS},
     )
     resp.raise_for_status()
-    items = _extract_items(resp.json())
+    data = resp.json()
+    items = data.get("data", []) if isinstance(data, dict) else data
 
     levels = []
     for raw in items:
         if isinstance(raw, dict):
-            lvl = normalize(raw)
+            lvl = from_search(raw)
             if lvl:
                 levels.append(lvl)
     levels = levels[:MAX_RESULTS]
@@ -228,7 +208,7 @@ def card_text(lvl: dict) -> str:
         lines.append(f"🎉 Enjoyment: <b>{html.escape(lvl['enjoyment'])}</b>")
     lines.append(f"🆔 ID: <code>{html.escape(str(lvl['id']))}</code>")
     if lvl["song_name"]:
-        lines.append(f"🎵 Музыка: {html.escape(lvl['song_name'])}")
+        lines.append(f"🎵 Музыка: {html.escape(str(lvl['song_name']))}")
     lines.append(f'🔗 <a href="{html.escape(lvl["url"], quote=True)}">Открыть в GDDL</a>')
     return "\n".join(lines)
 
@@ -240,19 +220,20 @@ def keyboard(lvl: dict) -> InlineKeyboardMarkup:
         + quote_plus(f"{lvl['name']} geometry dash showcase")
     )
     row = [InlineKeyboardButton("🎬 Шоукейс", url=showcase)]
-    if lvl["music"]:
-        row.append(InlineKeyboardButton("🎵 Музыка", url=lvl["music"]))
+    music = _song_url(lvl["song_id"], lvl["song_name"])
+    if music:
+        row.append(InlineKeyboardButton("🎵 Музыка", url=music))
     return InlineKeyboardMarkup([row])
 
 
 def short_description(lvl: dict) -> str:
     parts = []
-    if lvl["rank"] is not None:
-        parts.append(f"#{lvl['rank']}")
+    if lvl["demon"]:
+        parts.append(lvl["demon"])
     if lvl["tier"]:
         parts.append(f"Tier {lvl['tier']}")
-    if lvl["enjoyment"]:
-        parts.append(f"Enj {lvl['enjoyment']}")
+    if lvl["rank"] is not None:
+        parts.append(f"#{lvl['rank']}")
     parts.append(f"ID {lvl['id']}")
     return " · ".join(parts)
 
@@ -332,13 +313,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def on_startup(app: Application) -> None:
     app.bot_data["http"] = httpx.AsyncClient(
         timeout=10.0,
-        headers={"User-Agent": "gddl-telegram-bot/1.1"},
+        headers={"User-Agent": "gddl-telegram-bot/1.2"},
         follow_redirects=True,
     )
 
 
 async def on_shutdown(app: Application) -> None:
     await app.bot_data["http"].aclose()
+
 
 # --------------------------------- МИНИ ВЕБ-СЕРВЕР FLASK ДЛЯ RENDER
 import threading

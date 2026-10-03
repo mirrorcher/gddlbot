@@ -48,12 +48,18 @@ SEARCH_PARAM = os.getenv("GDDL_SEARCH_PARAM", "name")
 DETAIL_PATH = os.getenv("GDDL_DETAIL_PATH", "/levels/{id}")
 LEVEL_URL_TEMPLATE = os.getenv("GDDL_LEVEL_URL", f"{GDDL_SITE}/level/{{id}}")
 
+# Global Demonlist (demonlist.org): позиция в топе для экстрим-демонов.
+DEMONLIST_API = os.getenv("DEMONLIST_API", "https://api.demonlist.org")
+DEMONLIST_PATH = os.getenv("DEMONLIST_PATH", "/level/classic/list")
+DEMONLIST_LIMIT = 50
+
 MAX_RESULTS = 10
 MIN_QUERY_LEN = 2
 CACHE_TTL = 300  # секунд
 
 _cache: dict[str, tuple[float, list[dict]]] = {}
 _detail_cache: dict[int, tuple[float, dict]] = {}
+_demonlist_cache: dict[str, tuple[float, dict[int, int]]] = {}
 
 YT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
@@ -118,6 +124,7 @@ def from_search(raw: dict) -> dict | None:
         "song_name": raw.get("songName") or None,
         "song_id": None,
         "rank": None,
+        "rank_source": None,  # "demonlist" или "gddl"
         "url": LEVEL_URL_TEMPLATE.format(id=level_id),
     }
 
@@ -130,6 +137,7 @@ def merge_detail(lvl: dict, d: dict) -> None:
     rank = d.get("DifficultyIndex")
     if rank:
         lvl["rank"] = rank
+        lvl["rank_source"] = "gddl"
     lvl["tier"] = _fmt_num(d.get("Rating")) or lvl["tier"]
     lvl["enjoyment"] = _fmt_num(d.get("Enjoyment")) or lvl["enjoyment"]
     lvl["demon"] = _demon_label(meta.get("Difficulty")) or lvl["demon"]
@@ -161,6 +169,57 @@ async def _enrich(client: httpx.AsyncClient, lvl: dict) -> None:
         merge_detail(lvl, detail)
 
 
+async def demonlist_positions(client: httpx.AsyncClient, term: str) -> dict[int, int]:
+    """{ID уровня в игре: позиция в Global Demonlist} для уровней, найденных по запросу."""
+    key = term.casefold()
+    now = time.time()
+    hit = _demonlist_cache.get(key)
+    if hit and now - hit[0] < CACHE_TTL:
+        return hit[1]
+
+    positions: dict[int, int] = {}
+    try:
+        resp = await client.get(
+            DEMONLIST_API + DEMONLIST_PATH,
+            params={"search": term, "limit": DEMONLIST_LIMIT},
+            timeout=6.0,
+        )
+        resp.raise_for_status()
+        levels = (resp.json().get("data") or {}).get("levels") or []
+        for item in levels:
+            ingame_id, placement = item.get("ingame_id"), item.get("placement")
+            if ingame_id and placement:
+                positions[int(ingame_id)] = int(placement)
+    except Exception as e:
+        log.info("demonlist lookup failed for %r: %s", term, type(e).__name__)
+        return {}  # при сбое не кэшируем, чтобы повторить при следующем запросе
+
+    _demonlist_cache[key] = (now, positions)
+    if len(_demonlist_cache) > 500:
+        _demonlist_cache.clear()
+    return positions
+
+
+async def apply_demonlist(client: httpx.AsyncClient, query: str, levels: list[dict]) -> None:
+    """Для уровней из demonlist позиция берётся только оттуда."""
+    positions = dict(await demonlist_positions(client, query))
+
+    # Если запрос широкий и нужный экстрим не попал в первую выдачу, ищем его по точному названию.
+    missing = [l for l in levels if l["demon"] == "Extreme Demon" and l["id"] not in positions]
+    if missing:
+        extra = await asyncio.gather(
+            *(demonlist_positions(client, l["name"]) for l in missing)
+        )
+        for found in extra:
+            positions.update(found)
+
+    for lvl in levels:
+        placement = positions.get(lvl["id"])
+        if placement:
+            lvl["rank"] = placement
+            lvl["rank_source"] = "demonlist"
+
+
 async def search_levels(client: httpx.AsyncClient, query: str) -> list[dict]:
     key = query.casefold()
     now = time.time()
@@ -185,6 +244,7 @@ async def search_levels(client: httpx.AsyncClient, query: str) -> list[dict]:
     levels = levels[:MAX_RESULTS]
 
     await asyncio.gather(*(_enrich(client, lvl) for lvl in levels))
+    await apply_demonlist(client, query, levels)
 
     _cache[key] = (now, levels)
     if len(_cache) > 500:
@@ -199,7 +259,8 @@ async def search_levels(client: httpx.AsyncClient, query: str) -> list[dict]:
 def card_text(lvl: dict) -> str:
     lines = [f"<b>{html.escape(lvl['name'])}</b>"]
     if lvl["rank"] is not None:
-        lines.append(f"🏆 Место в топе: <b>#{html.escape(str(lvl['rank']))}</b>")
+        label = "Место в топе" if lvl["rank_source"] == "demonlist" else "Место в GDDL"
+        lines.append(f"🏆 {label}: <b>#{html.escape(str(lvl['rank']))}</b>")
     if lvl["tier"]:
         lines.append(f"📊 Сложность (tier): <b>{html.escape(lvl['tier'])}</b>")
     if lvl["demon"]:
@@ -326,11 +387,16 @@ async def on_shutdown(app: Application) -> None:
 import threading
 from flask import Flask
 
+# Пинги каждые пару минут не должны засорять лог.
+logging.getLogger("werkzeug").setLevel(logging.WARNING)
+
 flask_app = Flask(__name__)
+
 
 @flask_app.route('/')
 def home():
     return "Бот стабильно работает и не спит!"
+
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -351,7 +417,7 @@ def main() -> None:
     )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(InlineQueryHandler(inline_query))
-    
+
     log.info("Бот успешно запущен вместе с веб-сервером")
     app.run_polling(allowed_updates=[Update.INLINE_QUERY, Update.MESSAGE])
 
